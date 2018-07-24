@@ -666,6 +666,100 @@ def _get_feed_dict_from_X(X, start, end, model, char_inputs, bidirectional):
 
     return feed_dict
 
+def get_randomly_initialized_ckpt(options, data, n_gpus, tf_save_dir,
+                                  restart_ckpt_file=None):
+
+    # Save the options
+    with open(os.path.join(tf_save_dir, 'options.json'), 'w') as fout:
+        fout.write(json.dumps(options))
+
+    with tf.device('/cpu:0'):
+        global_step = tf.get_variable(
+            'global_step', [],
+            initializer=tf.constant_initializer(0), trainable=False)
+
+        # set up the optimizer
+        lr = options.get('learning_rate', 0.2)
+        opt = tf.train.AdagradOptimizer(learning_rate=lr,
+                                        initial_accumulator_value=1.0)
+
+        # calculate the gradients on each GPU
+        tower_grads = []
+        models = []
+        train_perplexity = tf.get_variable(
+            'train_perplexity', [],
+            initializer=tf.constant_initializer(0.0), trainable=False)
+        norm_summaries = []
+        for k in range(n_gpus):
+            with tf.device('/gpu:%d' % k):
+                with tf.variable_scope('lm', reuse=k > 0):
+                    # calculate the loss for one model replica and get
+                    #   lstm states
+                    model = LanguageModel(options, True)
+                    loss = model.total_loss
+                    models.append(model)
+                    # get gradients
+                    grads = opt.compute_gradients(
+                        loss * options['unroll_steps'],
+                        aggregation_method=tf.AggregationMethod.EXPERIMENTAL_TREE,
+                    )
+                    tower_grads.append(grads)
+                    # keep track of loss across all GPUs
+                    train_perplexity += loss
+
+        print_variable_summary()
+
+        # calculate the mean of each gradient across all GPUs
+        grads = average_gradients(tower_grads, options['batch_size'], options)
+        grads, norm_summary_ops = clip_grads(grads, options, True, global_step)
+        norm_summaries.extend(norm_summary_ops)
+
+        # log the training perplexity
+        train_perplexity = tf.exp(train_perplexity / n_gpus)
+        perplexity_summmary = tf.summary.scalar(
+            'train_perplexity', train_perplexity)
+
+        # some histogram summaries.  all models use the same parameters
+        # so only need to summarize one
+        histogram_summaries = [
+            tf.summary.histogram('token_embedding', models[0].embedding)
+        ]
+        # tensors of the output from the LSTM layer
+        lstm_out = tf.get_collection('lstm_output_embeddings')
+        histogram_summaries.append(
+                tf.summary.histogram('lstm_embedding_0', lstm_out[0]))
+        if options.get('bidirectional', False):
+            # also have the backward embedding
+            histogram_summaries.append(
+                tf.summary.histogram('lstm_embedding_1', lstm_out[1]))
+
+        # apply the gradients to create the training operation
+        train_op = opt.apply_gradients(grads, global_step=global_step)
+
+        # histograms of variables
+        for v in tf.global_variables():
+            histogram_summaries.append(tf.summary.histogram(v.name.replace(":", "_"), v))
+
+        # get the gradient updates -- these aren't histograms, but we'll
+        # only update them when histograms are computed
+        histogram_summaries.extend(
+            summary_gradient_updates(grads, opt, lr))
+
+        saver = tf.train.Saver(tf.global_variables(), max_to_keep=2)
+        summary_op = tf.summary.merge(
+            [perplexity_summmary] + norm_summaries
+        )
+        hist_summary_op = tf.summary.merge(histogram_summaries)
+
+        init = tf.initialize_all_variables()
+
+    # do the training loop
+    bidirectional = options.get('bidirectional', False)
+    with tf.Session(config=tf.ConfigProto(
+            allow_soft_placement=True)) as sess:
+        sess.run(init)
+        checkpoint_path = os.path.join(tf_save_dir, 'model.ckpt')
+        saver.save(sess, checkpoint_path, global_step=global_step)
 
 def train(options, data, n_gpus, tf_save_dir, tf_log_dir,
           restart_ckpt_file=None):
