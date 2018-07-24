@@ -2,7 +2,7 @@ import argparse
 
 import numpy as np
 
-from bilm.training import train, load_options_latest_checkpoint, load_vocab
+from bilm.training import get_randomly_initalized_ckpt, train, load_options_latest_checkpoint, load_vocab
 from bilm.data import BidirectionalLMDataset
 
 
